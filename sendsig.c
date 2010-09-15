@@ -33,6 +33,8 @@
 #include <linux/timer.h>
 #include <linux/jiffies.h>
 #include <asm/cputime.h>
+#include <linux/list.h>
+#include <linux/slab.h>
 
 #define MOD_AUTHOR "Domenico Delle Side <domenico.delleside@alcacoop.it>"
 #define MOD_DESC "Small kernel module to check a process' cpu usage and kill it if too high"
@@ -42,6 +44,10 @@
 #define MAX_CPU_SHARE 90
 #define WAIT_TIMEOUT 10
 #define MAX_CHECKS 6 
+
+/* ACTIONS ON USER INPUT*/
+#define ADD_PID 1
+#define REMOVE_PID 2
 
 static int sig_to_send = SIG_TO_SEND;
 static ushort max_cpu_share = MAX_CPU_SHARE;
@@ -57,12 +63,18 @@ MODULE_PARM_DESC(wait_timeout, " The number of seconds to wait between each chec
 module_param(max_checks, ushort, 0000);
 MODULE_PARM_DESC(max_checks, " The number of checks after which the signal is sent (default: 6)");
 
-static struct timer_list check_timer;
-static struct task_struct *check_task;
+struct sendsig_struct {
+  pid_t pid;
+  struct task_struct *task;
+  struct timer_list timer;
+  cputime_t last_cputime;
+  ushort count;
+  unsigned long secs;
+  struct list_head list;
+};
+
+struct sendsig_struct check_tasks;
 static struct dentry *file;
-static pid_t pid;
-static cputime_t last_cputime;
-static ushort count_check;
 
 /* 
    This function is not exported to modules by the kernel, so let's
@@ -123,20 +135,20 @@ out:
 }
 
 
-static ushort thread_group_cpu_share(struct task_struct *task) 
+static ushort thread_group_cpu_share(struct sendsig_struct *check) 
 {
   struct task_cputime times;
   cputime_t num_load, div_load, total_time;
   ushort share;
 
-  my_thread_group_cputime(task, &times);  
+  my_thread_group_cputime(check->task, &times);  
   total_time = cputime_add(times.utime, times.stime);
   /*
     last_cputime == 0 means that the timer_function has been called
     for the first time and we have to collect info before doing any
     check.
   */
-  if (unlikely(last_cputime == 0)) {
+  if (unlikely(check->last_cputime == 0)) {
     share = 0;
     printk(KERN_INFO "sendsig: timer initialization completed\n");
   } else {
@@ -144,17 +156,17 @@ static ushort thread_group_cpu_share(struct task_struct *task)
       Let's compute the share of cpu usage for the last WAIT_TIMEOUT
       seconds
     */
-    num_load = cputime_sub(total_time, last_cputime) * 100;
+    num_load = cputime_sub(total_time, check->last_cputime) * 100;
     div_load = jiffies_to_cputime(wait_timeout * HZ);
     share = (ushort)cputime_div(num_load, div_load);
     
     printk(KERN_DEBUG "sendsig: computed cpu share for process %d: %d\n", 
-	   pid, share);
+	   check->pid, share);
   }
   /*
     Update last_cputime
   */
-  last_cputime = total_time;
+  check->last_cputime = total_time;
 
   return share;
 }
@@ -180,6 +192,7 @@ static struct task_struct *get_check_task(pid_t pid)
   return task;
 }
 
+
 void signal_send(struct task_struct *task)
 {
     struct siginfo info;
@@ -197,109 +210,203 @@ void signal_send(struct task_struct *task)
 }
 
 
-static void timer_function(unsigned long par)
+static void timer_function(unsigned long data)
 { 
   ushort cpu_share; 
+  struct sendsig_struct *check = (struct sendsig_struct *)data;
 
-  if (unlikely(!pid_alive(check_task))) {
-    del_timer(&check_timer);
-    printk(KERN_INFO "sendsig: cannot find pid %i. Is the process still active? Timer removed\n", pid);
+  if (unlikely(!pid_alive(check->task))) {
+    del_timer(&check->timer);
+    printk(KERN_INFO "sendsig: cannot find pid %i. Is the process still active? Timer removed\n", check->pid);
     return;
   }
 
-  cpu_share = thread_group_cpu_share(check_task);
+  cpu_share = thread_group_cpu_share(check);
 
   if (cpu_share >= max_cpu_share) {
-    count_check++;
+    check->count++;
     printk(KERN_INFO "sendsig: current cpu share over limit of %i (check #%i)\n", 
-	   max_cpu_share, count_check);
+	   max_cpu_share, check->count);
 
 /* the ratio is: if the process has a cpu share higher than
    max_cpu_share for more than max_checks * wait_timeout seconds, then
    we'll send the signal sig_to_send to it
  */    
-    if (count_check >= max_checks) {
+    if (check->count >= max_checks) {
       /*
 	sending the signal to the process
       */
-      signal_send(check_task);
+      signal_send(check->task);
       /*
 	remove the timer
       */ 
-      del_timer(&check_timer);
-      printk(KERN_INFO "sendsig: sent signal to process %i, timer removed\n", pid);
+      del_timer(&check->timer);
+      printk(KERN_INFO "sendsig: sent signal to process %i, timer removed\n", check->pid);
       return;
     } 
   } else {
     /*
       if the process is being good, let's reset its counter
     */
-    count_check = 0;
+    check->count = 0;
   }  
   /*
     update the timer
   */
-  mod_timer(&check_timer, jiffies + wait_timeout * HZ); 
+  mod_timer(&check->timer, jiffies + wait_timeout * HZ); 
 
   return;
 }
 
 
-static ssize_t write_pid(struct file *file, const char __user *buf,
-			 size_t count, loff_t *ppos)
+static int register_pid(pid_t pid) 
 {
-  char mybuf[10];
-
-  if(unlikely(count > 10))
-    return -EINVAL;
-
-  /* 
-     let's see if a timer already exists. 
-  */
-  if (unlikely(check_timer.expires)) {
-    del_timer(&check_timer); /*... delete it */
-    printk(KERN_DEBUG "sendsig: initialization removed previous timer active on pid %i\n", pid);
-  }
-
-  copy_from_user(mybuf, buf, count);
-  sscanf(mybuf, "%d", &pid);
-
-  printk(KERN_INFO "sendsig: got pid = %d. Checking it every %i seconds, after timer initialization\n", 
-	 pid, wait_timeout);
+  struct sendsig_struct *sendsig;
+  sendsig = kmalloc(sizeof(struct sendsig_struct), GFP_KERNEL);
+  sendsig->pid = pid;
   /*
-     get the task struct to check
-  */
-  check_task = get_check_task(pid);
+   * get the task struct to check
+   */
+  sendsig->task = get_check_task(pid);
 
-  if (unlikely(check_task == NULL)) {
+  if (unlikely(sendsig->task == NULL)) {
     printk(KERN_INFO "sendsig: can't check non-existent process, exiting\n");
     return -ENODEV;
   }
   /*
-    update to zero the value of the last cputime usage
-  */
-  last_cputime = 0;
+   * start time of this pid
+   */
+  sendsig->secs = get_seconds();
   /*
-    update to zero the value of the check counter
-  */
-  count_check = 0;
+   * update to zero the value of the last cputime usage
+   */
+  sendsig->last_cputime = 0;
+  /*
+   * update to zero the value of the check counter
+   */
+  sendsig->count = 0;
   /* 
-     install the new timer
-  */
-  init_timer(&check_timer);
-  check_timer.function = timer_function;
-  check_timer.expires = jiffies + wait_timeout*HZ;
-  add_timer(&check_timer);
-  	
+   * install the new timer
+   */
+  init_timer(&sendsig->timer);
+  sendsig->timer.function = timer_function;
+  sendsig->timer.expires = jiffies + wait_timeout*HZ;
+  sendsig->timer.data = (unsigned long)sendsig;
+  add_timer(&sendsig->timer);
+
+  /*
+   * add sendsig to the check_tasks linked list 
+   */
+  list_add(&(sendsig->list), &(check_tasks.list));
+  
+  printk(KERN_INFO "sendsig: got pid = %d. Checking it every %i seconds, after timer initialization\n", 
+	 pid, wait_timeout);
+
+  return 1;
+}
+
+static ushort remove_pid(pid_t pid) 
+{
+  
+  return true;
+}
+
+static void release_check(struct sendsig_struct *check)
+{
+  del_timer(&(check->timer));
+  list_del(&(check->list));
+  kfree(check);  
+}
+
+static void free_sendsig_resources(void)
+{
+  struct sendsig_struct *c, *n;
+
+  list_for_each_entry_safe(c, n, &check_tasks.list, list) {
+    release_check(c);
+  }
+}
+
+
+static ushort get_sendsig_action(char *sign) 
+{
+  ushort action = 0;
+
+  if (*sign == '+')
+    action = ADD_PID;
+  else if(*sign == '-')
+    action = REMOVE_PID;
+
+  return action;
+}
+
+static ssize_t write_pid(struct file *file, char __user *buf,
+			 size_t count, loff_t *ppos)
+{
+  char mybuf[11];
+  ushort action = 0;
+  pid_t pid;
+
+  if(unlikely(count > 11))
+    return -EINVAL;
+
+  copy_from_user(mybuf, buf, count);
+  action = get_sendsig_action(mybuf);
+
+  if (action != 0)
+    sscanf(&mybuf[1], "%d", &pid);
+
+  switch(action) {
+
+  case ADD_PID:
+    printk("Adding pid %d\n", pid);
+    if (!register_pid(pid)) {
+      // printk
+      return -ENODEV;
+      }
+    break;
+
+  case REMOVE_PID:
+    printk("Removing pid %d\n", pid);
+    if (!remove_pid(pid)){
+      //printk
+      return -ENODEV;
+      }
+    break;
+
+  default:
+    printk("Bad argument\n");
+    return -ENODEV;
+  }
+
   return count;
 }
 
+
+static ssize_t read_pids(struct file *file, char __user *buf,
+			 size_t count, loff_t *ppos) 
+{
+  char mybuf[100];
+  sprintf(mybuf, "%lu: Tra poco ci sono\n", jiffies);
+
+  /*
+   * fill mybuf with a line for each pid
+   */
+
+  return simple_read_from_buffer(buf, count, ppos, mybuf, sizeof(mybuf));
+}
+
+
 static const struct file_operations sendsig_fops = {
+  .owner = THIS_MODULE,
   .write = write_pid,
+  .read = read_pids,
 };
+
 
 static int __init sendsig_module_init(void)
 {
+  LIST_HEAD(check_tasks);
   file = debugfs_create_file("sendsig", 0200, NULL, NULL, &sendsig_fops);
   printk(KERN_INFO "Module sendsig loaded\n");
 
@@ -309,7 +416,8 @@ static int __init sendsig_module_init(void)
 
 static void __exit sendsig_module_exit(void)
 {
-  del_timer(&check_timer);
+  // remove all timers
+  free_sendsig_resources();
   debugfs_remove(file);
   printk("Module sendsig unloaded\n");
 }
