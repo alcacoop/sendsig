@@ -35,6 +35,7 @@
 #include <asm/cputime.h>
 #include <linux/list.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 
 #define MOD_AUTHOR "Domenico Delle Side <domenico.delleside@alcacoop.it>"
 #define MOD_DESC "Small kernel module to check a process' cpu usage and kill it if too high"
@@ -75,6 +76,17 @@ struct sendsig_struct {
 
 struct sendsig_struct check_tasks;
 static struct dentry *file;
+
+ssize_t count_digits(unsigned long num)
+{
+  ssize_t len = 1;
+  unsigned long n = num;
+
+  while (n /= 10)
+    len++;
+
+  return len;
+}
 
 /* 
    This function is not exported to modules by the kernel, so let's
@@ -259,10 +271,15 @@ static void timer_function(unsigned long data)
 }
 
 
-static int register_pid(pid_t pid) 
+static ssize_t register_pid(pid_t pid) 
 {
   struct sendsig_struct *sendsig;
-  sendsig = kmalloc(sizeof(struct sendsig_struct), GFP_KERNEL);
+
+  if (unlikely(!(sendsig = kmalloc(sizeof(struct sendsig_struct), GFP_KERNEL)))) {
+    printk(KERN_ERR "sendsig: unable to allocate memory\n");
+    return -ENOMEM;
+  }
+
   sendsig->pid = pid;
   /*
    * get the task struct to check
@@ -305,11 +322,19 @@ static int register_pid(pid_t pid)
   return 1;
 }
 
-static ushort remove_pid(pid_t pid) 
-{
-  
-  return true;
+
+static struct sendsig_struct * get_check_by_pid(pid_t pid) {
+  struct sendsig_struct *c, *r;
+  r = NULL;
+
+  list_for_each_entry(c, &check_tasks.list, list) {
+    if (c->pid == pid)
+      r = c;
+  }
+
+  return r;
 }
+
 
 static void release_check(struct sendsig_struct *check)
 {
@@ -318,6 +343,7 @@ static void release_check(struct sendsig_struct *check)
   kfree(check);  
 }
 
+
 static void free_sendsig_resources(void)
 {
   struct sendsig_struct *c, *n;
@@ -325,6 +351,22 @@ static void free_sendsig_resources(void)
   list_for_each_entry_safe(c, n, &check_tasks.list, list) {
     release_check(c);
   }
+}
+
+
+static bool remove_pid(pid_t pid) 
+{
+  struct sendsig_struct *rem;
+
+  if (!(rem = get_check_by_pid(pid))) {
+    printk(KERN_INFO "sendsig: unable to find pid %d\n", pid);
+    return false;
+  }
+
+  release_check(rem);
+  printk(KERN_INFO "sendsig: pid %d has been removed\n", pid);
+  
+  return true;
 }
 
 
@@ -340,7 +382,7 @@ static ushort get_sendsig_action(char *sign)
   return action;
 }
 
-static ssize_t write_pid(struct file *file, char __user *buf,
+static ssize_t debugfs_on_write(struct file *file, const char __user *buf,
 			 size_t count, loff_t *ppos)
 {
   char mybuf[11];
@@ -359,54 +401,83 @@ static ssize_t write_pid(struct file *file, char __user *buf,
   switch(action) {
 
   case ADD_PID:
-    printk("Adding pid %d\n", pid);
+    printk(KERN_INFO "Adding pid %d\n", pid);
     if (!register_pid(pid)) {
-      // printk
+      printk(KERN_INFO "Unable to add pid %d\n", pid);
       return -ENODEV;
-      }
+    }
     break;
 
   case REMOVE_PID:
-    printk("Removing pid %d\n", pid);
-    if (!remove_pid(pid)){
-      //printk
+    printk(KERN_INFO "Removing pid %d\n", pid);
+    if (!remove_pid(pid)) {
+      printk(KERN_INFO "Unable to remove pid %d\n", pid);
       return -ENODEV;
-      }
+    }
     break;
 
   default:
-    printk("Bad argument\n");
+    printk("sendsig: bad argument\n");
     return -ENODEV;
   }
-
+  
   return count;
 }
 
 
-static ssize_t read_pids(struct file *file, char __user *buf,
+static ssize_t debugfs_on_read(struct file *file, char __user *buf,
 			 size_t count, loff_t *ppos) 
 {
-  char mybuf[100];
-  sprintf(mybuf, "%lu: Tra poco ci sono\n", jiffies);
+  struct sendsig_struct *t;
+  char *out = NULL;
+  char *tmp = NULL;
+  ssize_t buflen = 1;
+  ssize_t ret = 0;
+  
 
-  /*
-   * fill mybuf with a line for each pid
-   */
+  if (list_empty(&(check_tasks.list))) {
+    return simple_read_from_buffer(buf, count, ppos, "No pid registered\n", 18);
+  } 
 
-  return simple_read_from_buffer(buf, count, ppos, mybuf, sizeof(mybuf));
+    list_for_each_entry(t, &check_tasks.list, list) {
+      buflen += count_digits(t->secs)
+	+ count_digits((unsigned long)t->count)
+	+ count_digits((unsigned long)t->pid)
+	+ sizeof(t->task->comm)
+	+ 4; /* to take into account 3 spaces and a \n*/
+    }
+
+    if (unlikely(!(out = kmalloc(buflen * sizeof(char), GFP_KERNEL)))) {
+      printk(KERN_ERR "sendsig: unable to allocate memory\n");
+      return -ENOMEM;
+    }
+    
+    memset(out, 0, buflen * sizeof(char));
+    tmp = out;
+
+    list_for_each_entry(t, &check_tasks.list, list) {
+      sprintf(tmp, "%d %s %lu %d\n", t->pid, t->task->comm,
+	      t->secs, t->count);
+      tmp += strlen(tmp) + 1;
+    }
+
+    ret = simple_read_from_buffer(buf, count, ppos, out, buflen);
+    kfree(out);
+
+    return ret;
 }
 
 
 static const struct file_operations sendsig_fops = {
+  .read  = debugfs_on_read,
+  .write = debugfs_on_write,
   .owner = THIS_MODULE,
-  .write = write_pid,
-  .read = read_pids,
 };
 
 
 static int __init sendsig_module_init(void)
 {
-  LIST_HEAD(check_tasks);
+  INIT_LIST_HEAD(&check_tasks.list);
   file = debugfs_create_file("sendsig", 0200, NULL, NULL, &sendsig_fops);
   printk(KERN_INFO "Module sendsig loaded\n");
 
@@ -416,8 +487,12 @@ static int __init sendsig_module_init(void)
 
 static void __exit sendsig_module_exit(void)
 {
-  // remove all timers
-  free_sendsig_resources();
+  /*
+   * freeing all used resources
+   */
+  if (!list_empty(&(check_tasks.list)))
+    free_sendsig_resources();
+
   debugfs_remove(file);
   printk("Module sendsig unloaded\n");
 }
